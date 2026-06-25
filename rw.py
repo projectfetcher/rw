@@ -13,14 +13,12 @@ from urllib.parse import urljoin, urlparse, urlsplit, urlunsplit, parse_qsl, url
 import requests
 from bs4 import BeautifulSoup
 
-# Optional: load secrets from a local .env file if python-dotenv is installed.
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
 
-# Optional heavy deps used for Excel export only.
 try:
     import pandas as pd
     import openpyxl
@@ -28,7 +26,6 @@ try:
 except ImportError:
     _XLSX_AVAILABLE = False
 
-# Optional heavy deps used for paraphrase quality gating.
 try:
     import language_tool_python
     from sentence_transformers import SentenceTransformer, util as st_util
@@ -39,79 +36,41 @@ except ImportError:
 # =============================================================================
 #  CONFIG
 # =============================================================================
-#
-#  SOURCE
-#  ------
-#  https://jobs.newtimes.co.rw/  — The New Times Rwanda Jobs & Tenders portal.
-#  Powered by the Job-Market SaaS platform (not WordPress/JobMonster).
-#
-#  SITE STRUCTURE
-#  --------------
-#  Archive:  /jobs/search                  — all listings (JS-rendered card list)
-#            /jobs/search/announcement     — jobs only
-#            /jobs/search/tenders          — tenders only
-#  Detail:   /jobs/{numeric_id}-{slug}     — fully public, no login wall
-#
-#  The archive is a single-page React/Vue app: it renders cards server-side in
-#  the initial HTML but uses XHR for "load more". We therefore scrape both the
-#  initial HTML *and* the JSON API that backs it (see _NEWTIMES_API_URL).
-#
-#  JSON API (discovered from network tab pattern on similar Job-Market installs):
-#  GET /api/jobs?page=N&per_page=20[&category=announcement]
-#  Returns: { jobs: [{id, title, company, deadline, ...}], total_pages, ... }
-#  If the API is unavailable we fall back to HTML link scraping on the archive.
-#
-#  APPLY RULE (hard, network-wide)
-#  -------------------------------
-#  A job only posts if it exposes a PUBLIC apply path: an email, an external
-#  apply URL, or a clearly stated physical-submission address extracted from the
-#  body. Jobs without any of these are written to the flagged CSV.
-#  REQUIRE_PUBLIC_APPLY (default "1"/on) enforces this; set to "0" to post all.
-#
-#  CATEGORY FILTER
-#  ---------------
-#  SCRAPE_CATEGORY controls which listing type to scrape:
-#    "announcement"  — job announcements only  (default)
-#    "tenders"       — tenders only
-#    "all"           — everything
-# =============================================================================
 
-BASE_URL  = "https://jobs.newtimes.co.rw"
+BASE_URL = "https://jobs.newtimes.co.rw"
 
 # Category to scrape. Override with env var NEWTIMES_CATEGORY=tenders|all
 SCRAPE_CATEGORY = os.environ.get("NEWTIMES_CATEGORY", "announcement")
 
+# PATCH A: archive uses ?q=&page=N format, category as &category= param
+# The /jobs/search path is the SPA root — no sub-path segments for category.
 def _archive_url() -> str:
-    if SCRAPE_CATEGORY == "all":
-        return f"{BASE_URL}/jobs/search"
-    return f"{BASE_URL}/jobs/search/{SCRAPE_CATEGORY}"
+    return f"{BASE_URL}/jobs/search"
 
 JOBS_ARCHIVE_URL = _archive_url()
 
-# JSON API backing the listing pages (Job-Market SaaS standard endpoint).
-# If it returns a non-200 or non-JSON we fall back to HTML scraping.
+# JSON API — try both the standard endpoint and the category-specific one.
 _NEWTIMES_API_URL = f"{BASE_URL}/api/jobs"
+_NEWTIMES_API_ALT = f"{BASE_URL}/api/announcements"   # PATCH F: alternate endpoint
 
-# Enforce the public-apply-only rule.
 REQUIRE_PUBLIC_APPLY = os.environ.get("REQUIRE_PUBLIC_APPLY", "1") != "0"
 
 REQUEST_DELAY   = float(os.environ.get("REQUEST_DELAY", "1.5"))
-MAX_JOBS        = int(os.environ.get("MAX_JOBS", "0"))      # 0 = unlimited
-MAX_PAGES       = int(os.environ.get("MAX_PAGES", "20"))    # API / HTML pagination cap
+MAX_JOBS        = int(os.environ.get("MAX_JOBS", "0"))
+MAX_PAGES       = int(os.environ.get("MAX_PAGES", "20"))
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "25"))
 
 OUTPUT_FILE        = "newtimes_rwanda_jobs.xlsx"
 PROCESSED_IDS_FILE = "newtimes_rwanda_processed.csv"
 FLAGGED_FILE       = "newtimes_rwanda_flagged.csv"
 
-# CSV column names — defined once so _init_tracker, load, and upsert all agree.
 _TRACKER_FIELDS = ["Job ID", "Job URL", "Job Title", "Company Name",
                    "Status", "Timestamp", "WP ID"]
 
 _FLAGGED_FIELDS = ["Source", "Title", "Company", "Location", "Salary",
                    "Deadline", "Reason", "Apply Note", "Job URL", "Timestamp"]
 
-# ── WordPress ────────────────────────────────────────────────────────────────
+# ── WordPress ─────────────────────────────────────────────────────────────────
 WP_URL      = os.environ.get("WP_BASE_URL", "")
 WP_USER     = os.environ.get("WP_USERNAME", "")
 WP_PASSWORD = os.environ.get("WP_APP_PASSWORD", "")
@@ -119,14 +78,13 @@ WP_BASE      = WP_URL.rstrip("/")
 WP_JOBS_URL  = f"{WP_BASE}/job-listings"
 WP_MEDIA_URL = f"{WP_BASE}/media"
 
-# ── Mistral ──────────────────────────────────────────────────────────────────
+# ── Mistral ───────────────────────────────────────────────────────────────────
 MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "")
 MISTRAL_MODEL   = "mistral-small-latest"
 MISTRAL_URL     = "https://api.mistral.ai/v1/chat/completions"
 
 ENABLE_PARAPHRASE = True
 
-# ── Startup warnings ─────────────────────────────────────────────────────────
 for _var, _val, _feature in [
     ("MISTRAL_API_KEY", MISTRAL_API_KEY, "paraphrasing"),
     ("WP_USERNAME",     WP_USER,         "WordPress posting"),
@@ -147,35 +105,60 @@ JOB_TYPE_MAPPING = {
     "tenders":   "contract",  "tender":   "contract",
 }
 
+# PATCH B: stronger browser fingerprint headers to avoid 403
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,*/*",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    "Referer": BASE_URL,
+    "Accept-Encoding": "gzip, deflate, br",
+    "Referer": BASE_URL + "/",
+    "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+    "Connection": "keep-alive",
 }
 
 SESSION = requests.Session()
 SESSION.headers.update(HEADERS)
 
-# Known Rwandan cities / districts, used to extract location from free text.
+# PATCH C: prime cookies by visiting the homepage before hitting any archive page
+_session_primed = False
+
+def _prime_session():
+    """Visit the homepage once to acquire session cookies, avoiding 403 on archive."""
+    global _session_primed
+    if _session_primed:
+        return
+    try:
+        r = SESSION.get(BASE_URL + "/", timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        _session_primed = True
+        log_.info(f"Session primed — cookies: {dict(SESSION.cookies)}")
+    except Exception as e:
+        log_.warning(f"Session priming failed (continuing anyway): {e}")
+        _session_primed = True   # don't retry on every call
+
 RWANDA_LOCATIONS = [
     "Kigali", "Gasabo", "Kicukiro", "Nyarugenge",
     "Musanze", "Rubavu", "Ngororero", "Karongi", "Rutsiro",
     "Rusizi", "Nyamasheke", "Ruhango", "Muhanga", "Kamonyi",
     "Huye", "Nyanza", "Gisagara", "Nyaruguru", "Nyamagabe",
     "Rwamagana", "Kayonza", "Kirehe", "Ngoma", "Bugesera",
-    "Nyagatare", "Gatsibo", "Kayonza", "Rulindo", "Gakenke",
+    "Nyagatare", "Gatsibo", "Rulindo", "Gakenke",
     "Burera", "Gicumbi",
-    # Province-level fallbacks
     "Kigali Province", "Southern Province", "Northern Province",
     "Eastern Province", "Western Province",
 ]
 DEFAULT_LOCATION = os.environ.get("NEWTIMES_DEFAULT_LOCATION", "Kigali, Rwanda")
 
-# Emails / hosts that are the platform itself — never a real apply address.
 _NON_APPLY_EMAIL_DOMAINS = ("newtimes.co.rw", "jobs.newtimes.co.rw")
 _NON_APPLY_HOST_SUBSTR = (
     "newtimes.co.rw", "facebook.", "twitter.", "x.com", "linkedin.",
@@ -233,11 +216,8 @@ MONTHS = {
     "aug": 8, "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12,
 }
 
-# NewTimes meta line: "Published on DD-MM-YYYY | Deadline DD-MM-YYYY"
-# Also catches "Posted DD-MM-YYYY" variants.
 _META_DMY_RE = re.compile(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b")
 
-# Ordinal text date e.g. "30th June 2026" / "7th July, 2026".
 TEXT_DATE_RE = re.compile(
     r"(\d{1,2})\s*(?:st|nd|rd|th)?\s+([A-Za-z]+)\s*[.,]?\s*(\d{4})", re.I
 )
@@ -247,7 +227,6 @@ DEADLINE_LABELS = ("application deadline", "closing date", "deadline",
                    "deadline for applications", "closing date and time",
                    "date de clôture")
 
-# Heading lines that introduce the application instructions.
 _APPLY_HEAD_PHRASES = re.compile(
     r"^(?:how\s*(?:and|&)\s*deadline\s*to\s*apply|how\s*to\s*apply(?:\s*(?:and|&)\s*deadline)?|"
     r"how\s*to\s*submit|to\s*apply|application\s*(?:and|&)\s*deadline|"
@@ -332,6 +311,7 @@ def strip_tracking_params(url):
 # =============================================================================
 
 def get_soup(url: str) -> BeautifulSoup:
+    _prime_session()
     resp = SESSION.get(url, timeout=REQUEST_TIMEOUT)
     resp.raise_for_status()
     resp.encoding = resp.apparent_encoding or "utf-8"
@@ -340,11 +320,23 @@ def get_soup(url: str) -> BeautifulSoup:
     except Exception:
         return BeautifulSoup(resp.text, "html.parser")
 
+def get_raw(url: str) -> str:
+    """Return raw response text (for __NEXT_DATA__ extraction)."""
+    _prime_session()
+    resp = SESSION.get(url, timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    resp.encoding = resp.apparent_encoding or "utf-8"
+    return resp.text
+
 def get_json(url: str, params: dict = None) -> dict | None:
     """Attempt a JSON API call; return None on any failure."""
+    _prime_session()
     try:
         hdrs = dict(SESSION.headers)
         hdrs["Accept"] = "application/json, text/javascript, */*"
+        hdrs["Sec-Fetch-Dest"] = "empty"
+        hdrs["Sec-Fetch-Mode"] = "cors"
+        hdrs["X-Requested-With"] = "XMLHttpRequest"
         resp = SESSION.get(url, params=params, headers=hdrs, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         return resp.json()
@@ -408,12 +400,10 @@ def parse_any_date(text: str) -> str:
 
 def clean_title(raw: str) -> str:
     t = sanitize_text(raw)
-    # Strip " | Published on … | Deadline …" suffixes that appear in <title> tags.
     t = re.sub(r"\s*\|?\s*[Pp]ublished\s+on\s+.*", "", t)
     t = re.sub(r"\s*\|?\s*[Dd]eadline\s+.*", "", t)
     t = re.sub(r"\s*[–—-]\s*[Tt]he\s+[Nn]ew\s+[Tt]imes.*", "", t)
     t = re.sub(r"\s*\|\s*Rwanda jobs.*", "", t, flags=re.I)
-    # Strip trailing "Job at Company" if present (it's in the og:title).
     t = re.sub(r"\s+[Jj]ob\s+at\s+.+$", "", t)
     return t.strip()
 
@@ -440,24 +430,21 @@ def extract_experience(text: str) -> str:
     return ""
 
 def extract_salary(text: str) -> str:
-    """Best-effort salary extraction. NewTimes rarely lists a figure."""
     if not text:
         return ""
-    # RWF / Rwandan Franc patterns
     m = re.search(
         r"(?:RWF|Rwf|FRW|RW\s*F)\s*([0-9]{1,3}(?:[,.\s][0-9]{3})*(?:\.[0-9]+)?)", text
     )
     if m:
         amt = re.sub(r"[\s,]", "", m.group(1))
         return f"RWF {amt}"
-    # Generic salary keyword
     m = re.search(r"\b(?:salary|remuneration|pay)\b[^.\n]{0,80}", text, re.I)
     if m and re.search(r"\d", m.group(0)):
         return m.group(0).strip().rstrip(".")
     return ""
 
 # =============================================================================
-#  CANONICAL NORMALISERS  (shared schema — unchanged from the Gambia pipeline)
+#  CANONICAL NORMALISERS
 # =============================================================================
 
 def _kw_hit(text_low: str, keywords) -> bool:
@@ -559,7 +546,6 @@ def extract_experience_band(text: str) -> str:
         return "1 - 2 Years"
     return ""
 
-# ── Job field map (same as Gambia pipeline) ─────────────────────────────────
 FIELD_KEYWORD_MAP = [
     ("Information Technology",
      ["software engineer", "developer", "devops", "frontend", "backend", "full stack", "fullstack",
@@ -664,7 +650,7 @@ _TENDER_TITLE_RE = re.compile(
     r"|specific\s+procurement|general\s+procurement"
     r"|call\s+for\s+(?:bid|bids|tender|tenders|proposal|proposals|expression|expressions|quotation)"
     r"|matching\s+grant|terms\s+of\s+reference|prior\s+notice\s+of\s+procurement"
-    r"|itangazo\s+ry.isoko",   # Kinyarwanda tender announcement phrase
+    r"|itangazo\s+ry.isoko",
     re.I,
 )
 TENDER_FIELD = "Public Notices & Tenders"
@@ -673,7 +659,6 @@ def infer_field(title: str, description: str, fallback_categories: str = "") -> 
     title_l = (title or "").lower()
     if _TENDER_TITLE_RE.search(title_l):
         return TENDER_FIELD
-
     text = f"{title}\n{description}".lower()
     for field, strong, _weak in FIELD_KEYWORD_MAP:
         if _kw_hit(text, strong):
@@ -780,7 +765,7 @@ def mistral_generate(prompt: str, max_tokens: int = 400, temperature: float = 0.
         return ""
 
 # =============================================================================
-#  PARAPHRASE FUNCTIONS  (unchanged from Gambia pipeline)
+#  PARAPHRASE FUNCTIONS
 # =============================================================================
 
 def _print_wrapped(text: str, prefix: str = "   ", width: int = 100):
@@ -1017,8 +1002,8 @@ def _upsert_row(job_id: str, updates: dict):
         log_.error(f"Tracker write error: {e}")
 
 def make_job_id(job_url: str, title: str = "", company: str = "") -> str:
-    # Prefer the numeric ID embedded in the NewTimes URL slug.
-    m = re.search(r"/jobs/(\d{6,})", job_url or "")
+    # PATCH E: accept 5+ digit IDs (not just 6+)
+    m = re.search(r"/jobs/(\d{5,})", job_url or "")
     if m:
         return m.group(1)
     if job_url:
@@ -1076,7 +1061,7 @@ def write_flagged(raw_job: dict, reason: str, apply_note: str):
         log_.error(f"Flagged write error: {e}")
 
 # =============================================================================
-#  WORDPRESS POSTING  (unchanged from Gambia pipeline)
+#  WORDPRESS POSTING
 # =============================================================================
 
 def _wp_auth_headers() -> dict:
@@ -1146,7 +1131,6 @@ def post_job_to_wordpress(job: dict) -> tuple:
     if not (is_email or is_url_v):
         application = ""
 
-    # Upload logo
     attachment_id = None
     if logo_url:
         try:
@@ -1213,27 +1197,8 @@ def post_job_to_wordpress(job: dict) -> tuple:
 # =============================================================================
 #  STEP 1 — COLLECT JOB DETAIL URLS
 # =============================================================================
-#
-#  NewTimes/Job-Market SaaS uses a hybrid rendering approach:
-#
-#  Strategy A — JSON API (preferred):
-#    GET /api/jobs?page=N&per_page=20&category=<slug>
-#    Returns a JSON payload with job cards. We walk pages until empty.
-#    The numeric "id" in each card IS the job's numeric prefix in the detail URL,
-#    so we can reconstruct the full detail URL directly without fetching the
-#    archive HTML at all.
-#
-#  Strategy B — HTML scrape (fallback):
-#    The archive page renders cards server-side in the initial HTML. Each card
-#    contains an <a href="/jobs/{id}-{slug}"> link. We collect these links and
-#    paginate by trying ?page=N (or /page/N/) query param variants.
-#
-#  Both strategies normalise to the canonical detail URL form:
-#    https://jobs.newtimes.co.rw/jobs/{numeric_id}-{slug}
-# =============================================================================
 
 def _norm_detail_url(path_or_url: str) -> str:
-    """Canonicalise a /jobs/{id}-{slug} URL to https, no trailing slash."""
     if not path_or_url:
         return ""
     if path_or_url.startswith("http"):
@@ -1244,40 +1209,89 @@ def _norm_detail_url(path_or_url: str) -> str:
     path = p.path.rstrip("/")
     return urlunsplit(("https", "jobs.newtimes.co.rw", path, "", ""))
 
+# PATCH E: lowered min digit count to 5
 def _is_job_detail_path(path: str) -> bool:
-    """True for /jobs/{numeric_id}-{slug} only — not /jobs/search, /jobs/map, etc."""
     parts = [s for s in path.split("/") if s]
     if len(parts) != 2 or parts[0] != "jobs":
         return False
-    # Detail slugs always start with a long numeric ID.
-    return bool(re.match(r"^\d{6,}", parts[1]))
+    return bool(re.match(r"^\d{5,}", parts[1]))
+
+# PATCH D-1: extract job links from __NEXT_DATA__ / __NUXT__ JSON blobs
+def _extract_links_from_page_data(html: str) -> list:
+    """
+    NewTimes uses a JS framework (Next.js or Nuxt). Job card data is embedded
+    in a <script id="__NEXT_DATA__"> or window.__NUXT__ block in the HTML.
+    Extract all /jobs/{id}-{slug} href values from these blobs.
+    """
+    links = []
+    # Pattern 1: Next.js  <script id="__NEXT_DATA__" type="application/json">
+    nd_match = re.search(r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',
+                         html, re.S | re.I)
+    if nd_match:
+        try:
+            data = json.loads(nd_match.group(1))
+            blob = json.dumps(data)
+            for m in re.finditer(r'"/jobs/(\d{5,}-[^"]+)"', blob):
+                links.append(f"/jobs/{m.group(1)}")
+        except Exception:
+            pass
+
+    # Pattern 2: Nuxt  window.__NUXT__={...}
+    nuxt_match = re.search(r'window\.__NUXT__\s*=\s*(\{.*?\})\s*;', html, re.S)
+    if nuxt_match:
+        try:
+            blob = nuxt_match.group(1)
+            for m in re.finditer(r'"/jobs/(\d{5,}-[^"]+)"', blob):
+                links.append(f"/jobs/{m.group(1)}")
+        except Exception:
+            pass
+
+    # Pattern 3: Any JSON-like string with jobs path (catch-all)
+    for m in re.finditer(r'["\'](/jobs/\d{5,}-[^"\'\s>]+)["\']', html):
+        links.append(m.group(1))
+
+    return links
+
 
 def _collect_via_api(category: str, max_pages: int) -> list:
-    """
-    Walk the JSON API. Returns a list of canonical detail URLs, or [] if the
-    API endpoint is not available on this install.
-    """
+    """Walk the JSON API. Returns canonical detail URLs, or [] if unavailable."""
     print(C_BLUE(f"\n  Trying JSON API: {_NEWTIMES_API_URL}"))
     seen, ordered = set(), []
     cat_map = {"announcement": "announcement", "tenders": "tenders", "all": None}
     cat_param = cat_map.get(category)
 
+    # PATCH F: try both API endpoints
+    api_endpoints = [_NEWTIMES_API_URL, _NEWTIMES_API_ALT]
+    working_endpoint = None
+
+    for endpoint in api_endpoints:
+        params = {"page": 1, "per_page": 20}
+        if cat_param:
+            params["category"] = cat_param
+        data = get_json(endpoint, params=params)
+        if data is not None:
+            working_endpoint = endpoint
+            log(f"  API endpoint active: {endpoint}")
+            break
+
+    if working_endpoint is None:
+        log(C_DIM("  JSON API unavailable — switching to HTML fallback."))
+        return []
+
+    # Walk pages on the working endpoint
     for page in range(1, max_pages + 1):
         params = {"page": page, "per_page": 20}
         if cat_param:
             params["category"] = cat_param
-        data = get_json(_NEWTIMES_API_URL, params=params)
+        data = get_json(working_endpoint, params=params)
         if data is None:
-            log(C_DIM("  JSON API unavailable — switching to HTML fallback."))
-            return []                # signal fallback
+            break
 
-        # Normalise response shapes across Job-Market installs:
-        #   { jobs: [...] }  OR  { data: [...] }  OR  [ ... ]
         jobs_list = []
         if isinstance(data, list):
             jobs_list = data
         elif isinstance(data, dict):
-            jobs_list = data.get("jobs") or data.get("data") or []
+            jobs_list = data.get("jobs") or data.get("data") or data.get("results") or []
 
         if not jobs_list:
             log(C_DIM(f"  API page {page}: empty — stopping."))
@@ -1297,12 +1311,10 @@ def _collect_via_api(category: str, max_pages: int) -> list:
 
         log(f"    API page {page}: {page_new} new link(s) (total {len(ordered)})")
 
-        # If the API signals total pages, respect it.
         total_pages = (data.get("total_pages") or data.get("last_page") or 0
                        if isinstance(data, dict) else 0)
         if total_pages and page >= total_pages:
             break
-
         if page_new == 0:
             break
 
@@ -1310,44 +1322,80 @@ def _collect_via_api(category: str, max_pages: int) -> list:
 
     return ordered
 
+
+# PATCH A+D: corrected archive URL params and __NEXT_DATA__ extraction
 def _collect_via_html(archive_url: str, max_pages: int) -> list:
     """
-    Scrape the archive HTML pages for job detail links.
-    Tries ?page=N query param; if that misses, tries /page/N/ path.
+    Scrape archive HTML for job detail links.
+    1. Try ?q=&page=N (correct query param format for this SPA)
+    2. Check __NEXT_DATA__ / __NUXT__ blobs for embedded card data
+    3. Fall back to raw href scanning
     """
+    cat_param = ""
+    if SCRAPE_CATEGORY == "announcement":
+        cat_param = "announcement"
+    elif SCRAPE_CATEGORY == "tenders":
+        cat_param = "tenders"
+
     print(C_BLUE(f"\n  Collecting job links from HTML: {archive_url}"))
     seen, ordered = set(), []
     empty_streak = 0
 
     for page in range(1, max_pages + 1):
-        url = f"{archive_url}?page={page}" if page > 1 else archive_url
+        # Build the correct query string: ?q=&page=N[&category=X]
+        params = {"q": "", "page": page}
+        if cat_param:
+            params["category"] = cat_param
+
+        param_str = "&".join(f"{k}={v}" for k, v in params.items())
+        url = f"{archive_url}?{param_str}"
+
         try:
-            soup = get_soup(url)
+            _prime_session()
+            resp = SESSION.get(url, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            raw_html = resp.text
         except requests.HTTPError as e:
-            log(C_DIM(f"  Page {page}: HTTP {getattr(e.response,'status_code','?')} — stopping."))
+            status = getattr(e.response, 'status_code', '?')
+            log(C_RED(f"  Page {page}: HTTP {status} — {url}"))
+            if status == 403:
+                log(C_RED("  403 Forbidden — site may require JS execution (Cloudflare/bot protection)."))
+                log(C_DIM("  Tip: set NEWTIMES_COOKIE env var with a valid _session cookie from your browser."))
             break
         except Exception as e:
             log(C_DIM(f"  Page {page}: fetch error ({e}) — stopping."))
             break
 
         page_new = 0
-        for a in soup.find_all("a", href=True):
-            href = a["href"].strip()
-            # Resolve relative URLs.
-            if href.startswith("/"):
-                full = urljoin(BASE_URL, href)
-            elif href.startswith("http"):
-                full = href
-            else:
-                continue
-            path = urlparse(full).path
-            if not _is_job_detail_path(path):
-                continue
-            norm = _norm_detail_url(full)
-            if norm and norm not in seen:
+
+        # Strategy 1: __NEXT_DATA__ / __NUXT__ embedded JSON
+        embedded = _extract_links_from_page_data(raw_html)
+        for path in embedded:
+            norm = _norm_detail_url(path)
+            if norm and norm not in seen and _is_job_detail_path(urlparse(norm).path):
                 seen.add(norm)
                 ordered.append(norm)
                 page_new += 1
+
+        # Strategy 2: raw href scanning (SSR or partial hydration)
+        if page_new == 0:
+            soup = BeautifulSoup(raw_html, "html.parser")
+            for a in soup.find_all("a", href=True):
+                href = a["href"].strip()
+                if href.startswith("/"):
+                    full = urljoin(BASE_URL, href)
+                elif href.startswith("http"):
+                    full = href
+                else:
+                    continue
+                path = urlparse(full).path
+                if not _is_job_detail_path(path):
+                    continue
+                norm = _norm_detail_url(full)
+                if norm and norm not in seen:
+                    seen.add(norm)
+                    ordered.append(norm)
+                    page_new += 1
 
         log(f"    HTML page {page}: {page_new} new link(s) (total {len(ordered)})")
 
@@ -1362,6 +1410,7 @@ def _collect_via_html(archive_url: str, max_pages: int) -> list:
 
     return ordered
 
+
 def collect_job_links(archive_url: str, category: str, max_pages: int) -> list:
     """Return ordered, de-duplicated detail URLs using API first, HTML fallback."""
     links = _collect_via_api(category, max_pages)
@@ -1372,25 +1421,7 @@ def collect_job_links(archive_url: str, category: str, max_pages: int) -> list:
 # =============================================================================
 #  STEP 2 — PARSE ONE NEWTIMES DETAIL PAGE
 # =============================================================================
-#
-#  NewTimes/Job-Market detail page layout (observed from search snippets):
-#
-#  Header block (above the job body):
-#    <h1 class="job-title">  or og:title  →  title (may have "Job at Company" suffix)
-#    "Kigali, Rwanda Full Time"            →  location + job type
-#    "Published DD-MM-YYYY | Deadline DD-MM-YYYY"  →  dates
-#    Employer name (in the header line or a sidebar)
-#
-#  Body:
-#    The main job content div — responsibilities, qualifications, how to apply.
-#    No persistent navigation chrome is embedded inside this div.
-#
-#  Selectors (Job-Market SaaS theme, confirmed from snippets):
-#    .job-description, .job-content, .single-job-content, .description
-#    The company name often appears in a "company-name" / "employer-name" element.
-# =============================================================================
 
-# Content selectors ordered by specificity for the Job-Market SaaS theme.
 _CONTENT_SELECTORS = [
     "div.job-description",
     "div.job-content",
@@ -1414,7 +1445,6 @@ def _find_content_el(soup: BeautifulSoup):
                 best, best_len = el, len(txt)
         if best and best_len > 300:
             return best
-    # Fallback: any element with substantial text that isn't a nav/header/footer.
     for tag in ("article", "section", "div"):
         for el in soup.find_all(tag):
             if el.find_parent(["nav", "header", "footer"]):
@@ -1445,7 +1475,6 @@ def _is_apply_heading_line(line: str) -> bool:
     return bool(_APPLY_HEAD_PHRASES.match(s))
 
 def _split_description_and_apply(content_text: str):
-    """Split body into (description, apply_text). Drops site-chrome boilerplate."""
     if not content_text:
         return "", ""
 
@@ -1476,13 +1505,6 @@ def _split_description_and_apply(content_text: str):
 
 
 def _extract_meta_line(soup: BeautifulSoup) -> str:
-    """
-    Pull the compact header meta line that contains:
-      "Published on DD-MM-YYYY | Deadline DD-MM-YYYY"
-    NewTimes encodes this in a <div class="job-meta"> or similar, and also
-    in the page's <title> / og:description tags.
-    """
-    # 1. Dedicated meta elements (Job-Market SaaS variants).
     for sel in (".job-meta", ".job-header-meta", ".post-meta", ".listing-meta",
                 "[class*='published']", "[class*='deadline']", "[class*='meta']"):
         el = soup.select_one(sel)
@@ -1491,7 +1513,6 @@ def _extract_meta_line(soup: BeautifulSoup) -> str:
             if "published" in t.lower() or "deadline" in t.lower():
                 return t
 
-    # 2. Search the page text for the characteristic pattern.
     page_text = soup.get_text(" ")
     m = re.search(
         r"[Pp]ublished\s+on\s+\d{1,2}[/-]\d{1,2}[/-]\d{4}"
@@ -1502,12 +1523,6 @@ def _extract_meta_line(soup: BeautifulSoup) -> str:
 
 
 def _extract_company(soup: BeautifulSoup, fallback_from_url_slug: str = "") -> tuple:
-    """
-    Return (company_name, company_profile_url).
-    NewTimes shows the company name prominently in the job header and links to
-    an /employers/{id}-{slug} profile page.
-    """
-    # 1. Dedicated company / employer elements.
     for sel in (".company-name", ".employer-name", ".company-title",
                 "[class*='company']", "[class*='employer']",
                 "a[href*='/employers/']"):
@@ -1519,13 +1534,11 @@ def _extract_company(soup: BeautifulSoup, fallback_from_url_slug: str = "") -> t
                 url = urljoin(BASE_URL, href) if href and not href.startswith("http") else href
                 return name, url
 
-    # 2. og:site_name / author meta.
     for prop in (("property", "article:author"), ("name", "author")):
         tag = soup.find("meta", attrs={prop[0]: prop[1]})
         if tag and tag.get("content"):
             return tag["content"].strip(), ""
 
-    # 3. Infer from URL slug: "/jobs/537903203-provision-of-cleaning-services-at-rwanda-finance-limited-..."
     if fallback_from_url_slug:
         m = re.search(r"-at-([a-z0-9-]+?)(?:-published-on|-deadline|-$)", fallback_from_url_slug, re.I)
         if m:
@@ -1536,28 +1549,22 @@ def _extract_company(soup: BeautifulSoup, fallback_from_url_slug: str = "") -> t
 
 
 def scrape_job_detail(url: str) -> dict:
-    """Parse a single NewTimes /jobs/{id}-{slug} page into a raw_job dict."""
     soup = get_soup(url)
 
-    # ── Title ────────────────────────────────────────────────────────────────
-    # NewTimes og:title: "Job Title Job at Company | Published on ... | Deadline ... | Rwanda jobs"
     og_title_tag = soup.find("meta", attrs={"property": "og:title"})
     og_title = (og_title_tag.get("content", "") if og_title_tag else "").strip()
     h1 = (soup.select_one("h1.job-title") or soup.select_one("h1.entry-title")
           or soup.select_one("h1") or soup.find("h1"))
     h1_text = h1.get_text(" ", strip=True) if h1 else ""
-    # Prefer h1 (shorter, cleaner) unless og_title gives a better clean.
     raw_title = h1_text or og_title
     title = clean_title(raw_title)
     if not title and og_title:
         title = clean_title(og_title)
 
-    # ── Logo ─────────────────────────────────────────────────────────────────
     logo = ""
     og_img = soup.find("meta", attrs={"property": "og:image"})
     if og_img and og_img.get("content"):
         logo = og_img["content"].strip()
-    # Fallback: employer profile image in sidebar or company card.
     if not logo:
         emp_img = (soup.select_one("a[href*='/employers/'] img") or
                    soup.select_one(".company-logo img") or
@@ -1565,11 +1572,9 @@ def scrape_job_detail(url: str) -> dict:
         if emp_img and emp_img.get("src"):
             logo = emp_img["src"].strip()
 
-    # ── Company ───────────────────────────────────────────────────────────────
-    url_slug = urlparse(url).path  # e.g. /jobs/537903203-provision-...-at-rwanda-finance-limited-...
+    url_slug = urlparse(url).path
     company_name, company_profile_url = _extract_company(soup, url_slug)
 
-    # Company's own website (sidebar).
     company_website = ""
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
@@ -1581,11 +1586,9 @@ def scrape_job_detail(url: str) -> dict:
             company_website = href
             break
 
-    # ── Meta: dates + location + job type ────────────────────────────────────
     meta_line = _extract_meta_line(soup)
     page_text  = soup.get_text("\n")
 
-    # Date posted + deadline from the "Published on DD-MM-YYYY | Deadline DD-MM-YYYY" line.
     date_posted = ""
     deadline    = ""
     pub_m = re.search(r"[Pp]ublished\s+on\s+(\d{1,2}[/-]\d{1,2}[/-]\d{4})", meta_line or page_text)
@@ -1595,7 +1598,6 @@ def scrape_job_detail(url: str) -> dict:
     if dead_m:
         deadline = parse_any_date(dead_m.group(1))
 
-    # If deadline label with text date appears in the body, prefer it.
     for lab in DEADLINE_LABELS:
         m = re.search(rf"{lab}\s*[:\-]?\s*([^\n<]{{3,60}})", page_text, re.I)
         if m:
@@ -1609,7 +1611,6 @@ def scrape_job_detail(url: str) -> dict:
     if not deadline:
         deadline = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
 
-    # Location: "Kigali, Rwanda" appears in the header meta line.
     location = DEFAULT_LOCATION
     loc_m = re.search(
         r"([A-Za-z][A-Za-z\s]+),?\s*(Rwanda|Kigali Province|Southern Province|"
@@ -1622,7 +1623,6 @@ def scrape_job_detail(url: str) -> dict:
     else:
         location = location_from_text(meta_line or page_text[:500])
 
-    # Job type: look for the type label near the header.
     job_type = "full-time"
     type_m = re.search(
         r"\b(Full[\s-]?Time|Part[\s-]?Time|Contract|Internship|Freelance|Volunteer|"
@@ -1632,7 +1632,6 @@ def scrape_job_detail(url: str) -> dict:
     if type_m:
         job_type = map_job_type(type_m.group(1).lower().strip())
 
-    # Category tag (sidebar or breadcrumb): e.g. "Tenders", "Announcement".
     category_tag = ""
     for sel in (".job-category", ".category-tag", ".post-category",
                 "a[href*='/jobs/search/']", "span.category"):
@@ -1643,7 +1642,6 @@ def scrape_job_detail(url: str) -> dict:
                 category_tag = t
                 break
 
-    # ── Body: description + how-to-apply ────────────────────────────────────
     content_el   = _find_content_el(soup)
     content_copy = BeautifulSoup(str(content_el), "lxml")
     content_text = html_block_to_text(content_copy)
@@ -1651,7 +1649,6 @@ def scrape_job_detail(url: str) -> dict:
     if not description:
         description = content_text
 
-    # ── Qualification + experience ────────────────────────────────────────────
     qual_block = ""
     qm = re.search(
         r"(?:^|\n)[ \t]*qualifications?(?:\s*(?:&|and)\s*experience)?(?:\s+\w+){0,3}\s*:?[ \t]*\n"
@@ -1667,14 +1664,11 @@ def scrape_job_detail(url: str) -> dict:
     qualification = extract_qualification(qual_block or description)
     experience    = extract_experience_band(qual_block or description)
 
-    # ── Job field ──────────────────────────────────────────────────────────────
     job_field = infer_field(title, description, category_tag)
 
-    # ── Apply target ───────────────────────────────────────────────────────────
     apply_email = ""
     apply_url   = ""
 
-    # 1) Anchors inside the content block.
     for a in content_el.find_all("a", href=True):
         href = a["href"].strip()
         if href.lower().startswith("mailto:"):
@@ -1684,7 +1678,6 @@ def scrape_job_detail(url: str) -> dict:
         elif _is_real_apply_url(href):
             apply_url = apply_url or strip_tracking_params(href)
 
-    # 2) Plain-text fallbacks from apply tail or full body.
     scan = apply_text or description
     if not apply_email:
         cand = extract_email(scan)
@@ -1696,8 +1689,6 @@ def scrape_job_detail(url: str) -> dict:
                 apply_url = strip_tracking_params(u.rstrip(".,);"))
                 break
 
-    # 3) Physical submission address (NewTimes tenders often have no email/URL).
-    #    We record it in apply_text so it surfaces in the flagged CSV if needed.
     physical_submit = ""
     phys_m = re.search(
         r"(?:submit(?:ted)?|send|deliver|drop)\b[^.\n]{0,120}"
@@ -1738,12 +1729,6 @@ def scrape_job_detail(url: str) -> dict:
 # =============================================================================
 
 def process_job(raw_job: dict, processed_ids: set, processed_urls: set, seen_content: set):
-    """
-    Returns (status, job_dict_or_None):
-        ("duplicate", None) — already processed
-        ("flagged",   None) — failed public-apply rule
-        ("ok",        dict) — ready to post
-    """
     job_url  = raw_job.get("job_url", "")
     title    = raw_job.get("title", "")
     company  = raw_job.get("company_name", "")
@@ -1764,11 +1749,9 @@ def process_job(raw_job: dict, processed_ids: set, processed_urls: set, seen_con
         return "duplicate", None
     seen_content.add(fingerprint)
 
-    # ── Public-apply rule ────────────────────────────────────────────────────
     apply_email = raw_job.get("apply_email", "")
     apply_url   = raw_job.get("apply_url", "")
     physical    = raw_job.get("physical_submit", "")
-    # Accept: email OR external URL OR physical submission instructions.
     qualifies   = bool(apply_email) or bool(apply_url) or bool(physical)
 
     if REQUIRE_PUBLIC_APPLY and not qualifies:
@@ -1794,7 +1777,6 @@ def process_job(raw_job: dict, processed_ids: set, processed_urls: set, seen_con
     else:
         print(C_DIM("  Paraphrasing skipped (ENABLE_PARAPHRASE=False or MISTRAL_API_KEY not set)"))
 
-    # Choose best apply target — email wins over URL; physical is last resort.
     application = apply_email or apply_url or physical
     apply_method = ("email" if apply_email
                     else "external_url" if apply_url
@@ -1903,11 +1885,33 @@ def _save_excel(jobs: list):
     log_.info(f"Saved {len(jobs)} rows -> {OUTPUT_FILE}")
 
 # =============================================================================
+#  COOKIE INJECTION SUPPORT
+# =============================================================================
+# If the site is behind Cloudflare or needs a real browser session, export
+# your browser cookies and set the NEWTIMES_COOKIE env var:
+#   export NEWTIMES_COOKIE="_session=abc123; cf_clearance=xyz"
+# The scraper will inject these into the session before any requests.
+
+def _inject_cookies():
+    raw = os.environ.get("NEWTIMES_COOKIE", "").strip()
+    if not raw:
+        return
+    for pair in raw.split(";"):
+        pair = pair.strip()
+        if "=" in pair:
+            k, v = pair.split("=", 1)
+            SESSION.cookies.set(k.strip(), v.strip(), domain="jobs.newtimes.co.rw")
+    log_.info(f"Injected {len(raw.split(';'))} cookie(s) from NEWTIMES_COOKIE env var")
+
+# =============================================================================
 #  MAIN
 # =============================================================================
 
 def main():
     start_time = datetime.now()
+
+    # Inject any manually supplied cookies before any network calls
+    _inject_cookies()
 
     print()
     print(C_HEADER("=" * 80))
@@ -1923,6 +1927,7 @@ def main():
     print(f"  WordPress post  : {'✅ enabled' if (WP_USER and WP_PASSWORD) else '❌ disabled'}")
     print(f"  Excel export    : {'✅ enabled' if _XLSX_AVAILABLE else '❌ disabled (pip install pandas openpyxl)'}")
     print(f"  NLP gating      : {'✅' if _NLP_AVAILABLE else '⚠️  no sentence-transformers / language-tool'}")
+    print(f"  Cookie inject   : {'✅ ' + os.environ.get('NEWTIMES_COOKIE','')[:40] if os.environ.get('NEWTIMES_COOKIE') else '❌ none set'}")
     print(f"  Started         : {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(C_HEADER("=" * 80))
 
@@ -1939,6 +1944,10 @@ def main():
 
     if not job_links:
         log(C_RED("  No job links found — nothing to do."))
+        log(C_DIM("  If you got 403 errors, try:"))
+        log(C_DIM("    1. export NEWTIMES_COOKIE='_session=<value>; cf_clearance=<value>'"))
+        log(C_DIM("       (copy cookies from browser DevTools → Network → any request to jobs.newtimes.co.rw)"))
+        log(C_DIM("    2. Set NEWTIMES_CATEGORY=all to broaden the search"))
         return
     print(C_GREEN(f"\n  Found {len(job_links)} job detail page(s) to process.\n"))
 
