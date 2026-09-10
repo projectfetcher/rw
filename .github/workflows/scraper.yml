@@ -22,6 +22,7 @@ jobs:
           WP_USERNAME:      ${{ secrets.WP_USERNAME }}
           WP_APP_PASSWORD:  ${{ secrets.WP_APP_PASSWORD }}
           WP_BASE_URL:      ${{ secrets.WP_BASE_URL }}
+          INTERNAL_BOT_KEY: ${{ secrets.INTERNAL_BOT_KEY }}
         run: python rw.py
       - name: Upload Excel output as artifact
         if: always()
